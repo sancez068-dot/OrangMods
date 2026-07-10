@@ -1,0 +1,16 @@
+# Основные зависимости (стабильная связка)
+fastapi==0.114.2
+pydantic==2.8.2
+uvicorn[standard]==0.30.6
+
+# Безопасность
+python-jose[cryptography]==3.3.0
+
+# База данных
+aiosqlite==0.20.0
+
+# Планировщик
+APScheduler==3.10.4
+
+# Дополнительно (если нужно)
+python-multipart==0.0.9

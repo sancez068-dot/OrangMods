@@ -1,0 +1,8 @@
+fastapi==0.111.1
+pydantic==2.7.4
+uvicorn[standard]==0.30.6
+
+python-jose[cryptography]==3.3.0
+aiosqlite==0.20.0
+APScheduler==3.10.4
+python-multipart==0.0.9

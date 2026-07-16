@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field, validator
 from jose import jwt, JWTError, ExpiredSignatureError
 from datetime import timezone
 import uvicorn
-from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from cachetools import TTLCache
 import asyncpg
@@ -129,6 +129,23 @@ class SettingsUpdate(BaseModel):
     support_email: Optional[str] = Field(None, max_length=100)
     download_zip_url: Optional[str] = Field(None, max_length=500)
     download_version: Optional[int] = Field(None, ge=1)
+
+# ============================================================
+# МОДЕЛИ ДЛЯ WEB APP
+# ============================================================
+
+class WebAppOrderCreate(BaseModel):
+    user_id: int
+    username: str = Field(..., max_length=100)
+    first_name: str = Field(..., max_length=100)
+    func_level: str = Field(..., max_length=50)
+    func_price: int = Field(..., ge=0)
+    duration: str = Field(..., max_length=50)
+    duration_price: int = Field(..., ge=0)
+    total_price: int = Field(..., ge=0)
+
+class WebAppOrderApprove(BaseModel):
+    key: Optional[str] = Field(None, max_length=100)
 
 # ============================================================
 # WEBSOCKET MANAGER
@@ -435,6 +452,46 @@ async def init_database():
             """, '<div style="padding:20px;background:linear-gradient(135deg,#ff7300,#ffb300);border-radius:12px;color:#fff;text-align:center;font-size:18px;">🍊 OrangMods - Ваш лучший выбор!</div>', True, True, None, 'all')
             logger.info("Created test advertisement")
             
+        # Таблица заказов Web App
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS webapp_orders (
+                id SERIAL PRIMARY KEY,
+                order_id TEXT UNIQUE NOT NULL,
+                user_id BIGINT NOT NULL,
+                username TEXT NOT NULL,
+                first_name TEXT NOT NULL,
+                func_level TEXT NOT NULL,
+                func_price INTEGER NOT NULL,
+                duration TEXT NOT NULL,
+                duration_price INTEGER NOT NULL,
+                total_price INTEGER NOT NULL,
+                status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'approved', 'rejected')),
+                key TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_webapp_orders_user_id ON webapp_orders(user_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_webapp_orders_status ON webapp_orders(status)")
+
+        # Таблица ключей Web App
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS webapp_keys (
+                id SERIAL PRIMARY KEY,
+                key_value TEXT UNIQUE NOT NULL,
+                user_id BIGINT NOT NULL,
+                name TEXT NOT NULL,
+                level TEXT NOT NULL,
+                duration TEXT NOT NULL,
+                purchase_date TIMESTAMP DEFAULT NOW(),
+                expiry_date TIMESTAMP,
+                status TEXT DEFAULT 'inactive' CHECK(status IN ('inactive', 'active', 'expired')),
+                code TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_webapp_keys_user_id ON webapp_keys(user_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_webapp_keys_key_value ON webapp_keys(key_value)")
+
         logger.info("Database initialized successfully")
     except Exception as e:
         logger.error(f"Database init error: {e}")
@@ -508,7 +565,7 @@ async def get_current_admin(credentials: HTTPAuthorizationCredentials = Depends(
 async def lifespan(app: FastAPI):
     await init_database()
     
-    scheduler = BackgroundScheduler()
+    scheduler = AsyncIOScheduler()
     scheduler.add_job(
         cleanup_expired_activations,
         trigger=IntervalTrigger(minutes=5),
@@ -737,6 +794,32 @@ async def cleanup_expired_activations():
 async def get_settings_dict(conn) -> dict:
     rows = await conn.fetch("SELECT key, value FROM settings")
     return {row['key']: row['value'] for row in rows}
+
+def parse_duration(duration_str: str) -> timedelta:
+    """Parse Russian duration strings like '3 недели', '30 дней', '1 месяц', '12 часов'."""
+    s = duration_str.strip().lower()
+    m = re.search(r'(\d+)\s*час', s)
+    if m:
+        return timedelta(hours=int(m.group(1)))
+    m = re.search(r'(\d+)\s*недел', s)
+    if m:
+        return timedelta(weeks=int(m.group(1)))
+    m = re.search(r'(\d+)\s*месяц', s)
+    if m:
+        return timedelta(days=int(m.group(1)) * 30)
+    m = re.search(r'(\d+)\s*д[нея]', s)
+    if m:
+        return timedelta(days=int(m.group(1)))
+    return timedelta(days=30)
+
+def generate_webapp_order_id() -> str:
+    num = secrets.randbelow(900000) + 100000
+    return f"#OM-{num}"
+
+def generate_webapp_key_value() -> str:
+    chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+    random_part = ''.join(secrets.choice(chars) for _ in range(10))
+    return f"OrangMods-WEBAPP-{random_part}"
 
 # ============================================================
 # HTML АДМИНКА (ПОЛНАЯ)
@@ -1673,6 +1756,7 @@ ADMIN_HTML = """<!DOCTYPE html>
                 <button class="tab" data-tab="tab2">➕ Создать</button>
                 <button class="tab" data-tab="tab3">📢 Уведомления</button>
                 <button class="tab" data-tab="tab4">🎯 Реклама</button>
+                <button class="tab" data-tab="tab5">📦 Заказы</button>
             </div>
 
             <div class="tab-content active" id="tab1">
@@ -1873,6 +1957,57 @@ ADMIN_HTML = """<!DOCTYPE html>
                 </div>
             </div>
 
+            <div class="tab-content" id="tab5">
+                <div class="card">
+                    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:14px;">
+                        <div class="card-title" style="margin:0;">📦 Заказы Web App</div>
+                        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                            <button class="btn btn-sm" id="ordersFilterAll" style="background:rgba(255,140,0,0.2);color:#ff9500;">Все</button>
+                            <button class="btn btn-sm" id="ordersFilterPending">⏳ Ожидают</button>
+                            <button class="btn btn-sm" id="ordersFilterApproved">✅ Одобрены</button>
+                            <button class="btn btn-sm" id="ordersFilterRejected">❌ Отклонены</button>
+                            <button class="btn btn-sm btn-success" id="refreshOrdersBtn">🔄</button>
+                        </div>
+                    </div>
+                    <div id="ordersStats" style="display:flex;gap:24px;margin-bottom:14px;flex-wrap:wrap;"></div>
+                    <div class="table-wrap">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>ID заказа</th>
+                                    <th>Пользователь</th>
+                                    <th>Уровень</th>
+                                    <th>Длительность</th>
+                                    <th>Сумма</th>
+                                    <th>Статус</th>
+                                    <th>Дата</th>
+                                    <th>Действия</th>
+                                </tr>
+                            </thead>
+                            <tbody id="ordersTableBody">
+                                <tr><td colspan="8" style="text-align:center;color:#666;padding:20px;">Загрузка...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div id="orderApproveModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:9999;display:none;align-items:center;justify-content:center;">
+                    <div style="background:#1a1a1a;border:1px solid rgba(255,140,0,0.3);border-radius:20px;padding:28px;max-width:420px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,0.8);">
+                        <div style="font-size:18px;font-weight:700;color:#ff9500;margin-bottom:16px;">✅ Одобрить заказ</div>
+                        <div id="approveModalDetails" style="color:#aaa;font-size:13px;margin-bottom:16px;line-height:1.6;"></div>
+                        <div class="field">
+                            <label style="color:#888;font-size:11px;">Ключ для выдачи (оставьте пустым — сгенерируется автоматически)</label>
+                            <input type="text" id="approveKeyInput" placeholder="OrangMods-... или пусто для авто" style="margin-top:6px;" />
+                        </div>
+                        <div style="display:flex;gap:10px;margin-top:16px;">
+                            <button class="btn btn-sm btn-success" id="confirmApproveBtn" style="flex:1;">✅ Одобрить</button>
+                            <button class="btn btn-sm btn-danger" id="cancelApproveBtn" style="flex:1;">Отмена</button>
+                        </div>
+                        <div class="success" id="approveModalResult" style="margin-top:10px;"></div>
+                    </div>
+                </div>
+            </div>
+
         </div>
     </div>
 
@@ -1985,6 +2120,24 @@ ADMIN_HTML = """<!DOCTYPE html>
 
                 async deleteAd(id) {
                     return this._fetch(`/ads/${id}`, { method: 'DELETE' });
+                }
+
+                async getWebappOrders(status) {
+                    const url = status ? `/webapp/orders?status=${status}` : '/webapp/orders';
+                    return this._fetch(url);
+                }
+
+                async approveWebappOrder(orderId, key) {
+                    return this._fetch(`/webapp/orders/${encodeURIComponent(orderId)}/approve`, {
+                        method: 'POST',
+                        body: JSON.stringify({ key: key || null })
+                    });
+                }
+
+                async rejectWebappOrder(orderId) {
+                    return this._fetch(`/webapp/orders/${encodeURIComponent(orderId)}/reject`, {
+                        method: 'POST'
+                    });
                 }
             }
 
@@ -2666,6 +2819,153 @@ ADMIN_HTML = """<!DOCTYPE html>
 
             adShowPreview.addEventListener('change', renderAd);
 
+            // ===== WEBAPP ORDERS =====
+            let webappOrders = [];
+            let ordersFilter = 'all';
+            let pendingApproveOrderId = null;
+
+            function renderOrders() {
+                const tbody = document.getElementById('ordersTableBody');
+                if (!tbody) return;
+
+                const filtered = ordersFilter === 'all'
+                    ? webappOrders
+                    : webappOrders.filter(o => o.status === ordersFilter);
+
+                const statusMap = { pending: '⏳ Ожидает', approved: '✅ Одобрен', rejected: '❌ Отклонён' };
+                const statusColors = { pending: '#f59e0b', approved: '#22c55e', rejected: '#ef4444' };
+
+                if (filtered.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#666;padding:20px;">Нет заказов</td></tr>';
+                    return;
+                }
+
+                tbody.innerHTML = filtered.map(o => `
+                    <tr>
+                        <td style="font-family:monospace;color:#ff9500;">${o.order_id}</td>
+                        <td>
+                            <div style="font-weight:600;">${o.first_name || '—'}</div>
+                            <div style="color:#666;font-size:10px;">@${o.username || '—'} · ${o.user_id}</div>
+                        </td>
+                        <td>${o.func_level || '—'}</td>
+                        <td>${o.duration || '—'}</td>
+                        <td style="color:#ff9500;font-weight:700;">${o.total_price}⭐</td>
+                        <td style="color:${statusColors[o.status] || '#aaa'};font-weight:600;">${statusMap[o.status] || o.status}</td>
+                        <td style="color:#666;font-size:11px;">${o.created_at ? new Date(o.created_at).toLocaleString('ru') : '—'}</td>
+                        <td>
+                            ${o.status === 'pending' ? `
+                                <button class="btn btn-sm btn-success" onclick="openApproveModal('${o.order_id}', '${(o.first_name||'').replace(/'/g,"\\'")}', '${o.func_level||''}', '${o.duration||''}')" style="margin-bottom:4px;">✅</button>
+                                <button class="btn btn-sm btn-danger" onclick="rejectOrderAdmin('${o.order_id}')">❌</button>
+                            ` : o.key ? `<span style="font-family:monospace;color:#69db7c;font-size:10px;">${o.key}</span>` : '—'}
+                        </td>
+                    </tr>
+                `).join('');
+
+                // Stats
+                const total = webappOrders.length;
+                const pending = webappOrders.filter(o => o.status === 'pending').length;
+                const approved = webappOrders.filter(o => o.status === 'approved').length;
+                const rejected = webappOrders.filter(o => o.status === 'rejected').length;
+                const statsEl = document.getElementById('ordersStats');
+                if (statsEl) {
+                    statsEl.innerHTML = [
+                        ['Всего', total, '#888'],
+                        ['Ожидают', pending, '#f59e0b'],
+                        ['Одобрены', approved, '#22c55e'],
+                        ['Отклонены', rejected, '#ef4444']
+                    ].map(([label, val, color]) => `
+                        <div style="text-align:center;">
+                            <div style="font-size:22px;font-weight:900;color:${color};">${val}</div>
+                            <div style="font-size:9px;letter-spacing:1px;color:#555;text-transform:uppercase;">${label}</div>
+                        </div>
+                    `).join('');
+                }
+            }
+
+            async function loadWebappOrders() {
+                try {
+                    const result = await api.getWebappOrders();
+                    webappOrders = result.orders || [];
+                    renderOrders();
+                } catch (e) {
+                    showToast('❌ Ошибка загрузки заказов: ' + e.message, 'error');
+                }
+            }
+
+            window.openApproveModal = function(orderId, firstName, level, duration) {
+                pendingApproveOrderId = orderId;
+                document.getElementById('approveKeyInput').value = '';
+                document.getElementById('approveModalResult').textContent = '';
+                document.getElementById('approveModalDetails').innerHTML =
+                    `<b>Заказ:</b> ${orderId}<br><b>Пользователь:</b> ${firstName}<br><b>Уровень:</b> ${level}<br><b>Длительность:</b> ${duration}`;
+                document.getElementById('orderApproveModal').style.display = 'flex';
+            };
+
+            window.rejectOrderAdmin = async function(orderId) {
+                if (!confirm(`Отклонить заказ ${orderId}?`)) return;
+                try {
+                    await api.rejectWebappOrder(orderId);
+                    showToast('❌ Заказ отклонён', 'error');
+                    await loadWebappOrders();
+                } catch (e) {
+                    showToast('❌ Ошибка: ' + e.message, 'error');
+                }
+            };
+
+            document.getElementById('confirmApproveBtn').addEventListener('click', async function() {
+                if (!pendingApproveOrderId) return;
+                const keyVal = document.getElementById('approveKeyInput').value.trim() || null;
+                this.disabled = true;
+                this.textContent = '⏳...';
+                try {
+                    const result = await api.approveWebappOrder(pendingApproveOrderId, keyVal);
+                    document.getElementById('approveModalResult').textContent = '✅ Одобрено! Ключ: ' + result.key;
+                    document.getElementById('approveModalResult').style.color = '#69db7c';
+                    showToast(`✅ Заказ одобрен, ключ: ${result.key}`, 'success');
+                    await loadWebappOrders();
+                    setTimeout(() => { document.getElementById('orderApproveModal').style.display = 'none'; }, 1500);
+                } catch (e) {
+                    document.getElementById('approveModalResult').textContent = '❌ ' + e.message;
+                    document.getElementById('approveModalResult').style.color = '#ff6b6b';
+                    showToast('❌ Ошибка: ' + e.message, 'error');
+                }
+                this.disabled = false;
+                this.textContent = '✅ Одобрить';
+            });
+
+            document.getElementById('cancelApproveBtn').addEventListener('click', function() {
+                document.getElementById('orderApproveModal').style.display = 'none';
+                pendingApproveOrderId = null;
+            });
+
+            ['ordersFilterAll', 'ordersFilterPending', 'ordersFilterApproved', 'ordersFilterRejected'].forEach(id => {
+                const btn = document.getElementById(id);
+                if (!btn) return;
+                const map = { ordersFilterAll: 'all', ordersFilterPending: 'pending', ordersFilterApproved: 'approved', ordersFilterRejected: 'rejected' };
+                btn.addEventListener('click', function() {
+                    ordersFilter = map[id];
+                    ['ordersFilterAll', 'ordersFilterPending', 'ordersFilterApproved', 'ordersFilterRejected'].forEach(bid => {
+                        const b = document.getElementById(bid);
+                        if (b) b.style.background = bid === id ? 'rgba(255,140,0,0.2)' : '';
+                        if (b) b.style.color = bid === id ? '#ff9500' : '';
+                    });
+                    renderOrders();
+                });
+            });
+
+            document.getElementById('refreshOrdersBtn').addEventListener('click', async function() {
+                this.textContent = '⏳';
+                await loadWebappOrders();
+                this.textContent = '🔄';
+            });
+
+            // Load orders when tab5 is clicked
+            document.addEventListener('click', function(e) {
+                if (e.target && e.target.dataset && e.target.dataset.tab === 'tab5') {
+                    loadWebappOrders();
+                }
+            });
+
             function initTabs() {
                 document.querySelectorAll('.tab').forEach(tab => {
                     tab.addEventListener('click', function() {
@@ -2914,7 +3214,7 @@ async def create_key(key_data: KeyCreate, current_admin: dict = Depends(get_curr
             key_data.max_percent, current_admin["id"],
             key_data.download_button, key_data.download_button_text, key_data.installed_button_text)
         
-        client_ip = request.client.host if request else "unknown"
+        client_ip = request.client.host if request and request.client else "unknown"
         await log_action(current_admin["id"], "create_key", f"Created key: {key_value}", client_ip)
         
         return {
@@ -2948,6 +3248,7 @@ async def delete_key(
         
         key_value = row['key_value']
         key_status = row['status']
+        devices = []
         
         if (key_status == 'active' or key_status == 'full') and force:
             devices = await conn.fetch(
@@ -3005,7 +3306,7 @@ async def delete_key(
             del INFO_CACHE[k]
             logger.info(f"Cache cleared for {k}")
         
-        client_ip = request.client.host if request else "unknown"
+        client_ip = request.client.host if request and request.client else "unknown"
         revoked_count = len(devices) if force and (key_status == 'active' or key_status == 'full') else 0
         await log_action(
             current_admin["id"], 
@@ -3432,7 +3733,7 @@ async def update_settings(
                 ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = NOW()
             """, key, str(value))
         
-        client_ip = request.client.host if request else "unknown"
+        client_ip = request.client.host if request and request.client else "unknown"
         await log_action(current_admin["id"], "update_settings", f"Updated settings: {list(updates.keys())}", client_ip)
         
         return {"message": "Settings updated successfully"}
@@ -3461,7 +3762,7 @@ async def create_notification(notif_data: NotificationCreate, current_admin: dic
             notif_data.text
         )
         
-        client_ip = request.client.host if request else "unknown"
+        client_ip = request.client.host if request and request.client else "unknown"
         await log_action(current_admin["id"], "create_notification", f"Created notification: {notif_data.text[:50]}...", client_ip)
         
         await manager.broadcast_to_devices({
@@ -3565,7 +3866,7 @@ async def send_device_notification(
             "data": notification.data
         })
         
-        client_ip = request.client.host if request else "unknown"
+        client_ip = request.client.host if request and request.client else "unknown"
         await log_action(
             current_admin["id"], 
             "send_device_notification", 
@@ -3613,7 +3914,7 @@ async def broadcast_notification(
             "data": broadcast.data
         }, broadcast.platform)
         
-        client_ip = request.client.host if request else "unknown"
+        client_ip = request.client.host if request and request.client else "unknown"
         await log_action(
             current_admin["id"], 
             "broadcast_notification", 
@@ -3776,7 +4077,7 @@ async def save_ads(ad_data: AdCreate, current_admin: dict = Depends(get_current_
             VALUES ($1, $2, true, $3, $4)
         """, ad_data.html, ad_data.is_closable, ad_data.version, ad_data.platform or 'all')
         
-        client_ip = request.client.host if request else "unknown"
+        client_ip = request.client.host if request and request.client else "unknown"
         version_info = f"for version {ad_data.version}" if ad_data.version else "for all versions"
         await log_action(
             current_admin["id"], 
@@ -3833,7 +4134,7 @@ async def delete_ad(
         
         await conn.execute("DELETE FROM advertisements WHERE id = $1", ad_id)
         
-        client_ip = request.client.host if request else "unknown"
+        client_ip = request.client.host if request and request.client else "unknown"
         await log_action(
             current_admin["id"],
             "delete_ad",
@@ -3860,7 +4161,7 @@ async def toggle_ad(
         if not row:
             raise HTTPException(status_code=404, detail="Ad not found")
         
-        client_ip = request.client.host if request else "unknown"
+        client_ip = request.client.host if request and request.client else "unknown"
         await log_action(
             current_admin["id"],
             "toggle_ad",
@@ -4051,6 +4352,396 @@ async def websocket_admin(websocket: WebSocket, admin_id: int):
     except Exception as e:
         logger.error(f"WebSocket error for admin {admin_id}: {e}")
         manager.disconnect_admin(admin_id)
+
+# ============================================================
+# API - WEB APP (/api/webapp/*)
+# ============================================================
+
+@app.post("/api/webapp/orders")
+async def webapp_create_order(order_data: WebAppOrderCreate):
+    conn = await get_db_connection()
+    try:
+        order_id = generate_webapp_order_id()
+        # Ensure uniqueness
+        for _ in range(5):
+            existing = await conn.fetchval("SELECT id FROM webapp_orders WHERE order_id = $1", order_id)
+            if not existing:
+                break
+            order_id = generate_webapp_order_id()
+
+        row = await conn.fetchrow("""
+            INSERT INTO webapp_orders (order_id, user_id, username, first_name, func_level,
+                func_price, duration, duration_price, total_price, status)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')
+            RETURNING id, created_at
+        """, order_id, order_data.user_id, order_data.username, order_data.first_name,
+            order_data.func_level, order_data.func_price, order_data.duration,
+            order_data.duration_price, order_data.total_price)
+
+        return {
+            "success": True,
+            "order_id": order_id,
+            "id": row['id'],
+            "created_at": row['created_at'].isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error creating webapp order: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        await conn.close()
+
+
+@app.get("/api/webapp/orders")
+async def webapp_get_all_orders(
+    status: Optional[str] = None,
+    current_admin: dict = Depends(get_current_admin)
+):
+    conn = await get_db_connection()
+    try:
+        query = "SELECT * FROM webapp_orders"
+        params = []
+        if status:
+            query += " WHERE status = $1"
+            params.append(status)
+        query += " ORDER BY created_at DESC"
+        rows = await conn.fetch(query, *params)
+        orders = [dict(row) for row in rows]
+        for o in orders:
+            if o.get('created_at'):
+                o['created_at'] = o['created_at'].isoformat()
+        return {"orders": orders}
+    finally:
+        await conn.close()
+
+
+@app.get("/api/webapp/orders/{user_id}")
+async def webapp_get_user_orders(user_id: int):
+    conn = await get_db_connection()
+    try:
+        rows = await conn.fetch("""
+            SELECT id, order_id, user_id, username, first_name, func_level,
+                   duration, total_price, status, key, created_at
+            FROM webapp_orders
+            WHERE user_id = $1
+            ORDER BY created_at DESC
+        """, user_id)
+        orders = []
+        for row in rows:
+            o = dict(row)
+            if o.get('created_at'):
+                o['created_at'] = o['created_at'].isoformat()
+            orders.append(o)
+        return {"orders": orders}
+    finally:
+        await conn.close()
+
+
+@app.post("/api/webapp/orders/{order_id}/approve")
+async def webapp_approve_order(
+    order_id: str,
+    body: WebAppOrderApprove = WebAppOrderApprove(),
+    current_admin: dict = Depends(get_current_admin),
+    request: Request = None
+):
+    conn = await get_db_connection()
+    try:
+        row = await conn.fetchrow("""
+            SELECT id, user_id, first_name, func_level, duration, status
+            FROM webapp_orders WHERE order_id = $1
+        """, order_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Order not found")
+        if row['status'] != 'pending':
+            raise HTTPException(status_code=400, detail=f"Order is already {row['status']}")
+
+        # Use provided key or auto-generate
+        key_value = body.key if body.key else generate_webapp_key_value()
+        user_id = row['user_id']
+        duration_str = row['duration']
+        func_level = row['func_level']
+        expiry_date = datetime.now() + parse_duration(duration_str)
+
+        # Create webapp_key entry
+        await conn.execute("""
+            INSERT INTO webapp_keys (key_value, user_id, name, level, duration,
+                purchase_date, expiry_date, status, code)
+            VALUES ($1, $2, $3, $4, $5, NOW(), $6, 'inactive', $1)
+            ON CONFLICT (key_value) DO NOTHING
+        """, key_value, user_id, row['first_name'], func_level, duration_str, expiry_date)
+
+        # Update order
+        await conn.execute("""
+            UPDATE webapp_orders SET status = 'approved', key = $1 WHERE order_id = $2
+        """, key_value, order_id)
+
+        client_ip = request.client.host if request and request.client else "unknown"
+        await log_action(current_admin["id"], "approve_webapp_order",
+                         f"Approved order {order_id}, key={key_value}", client_ip)
+
+        return {"success": True, "order_id": order_id, "key": key_value}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error approving webapp order: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        await conn.close()
+
+
+@app.post("/api/webapp/orders/{order_id}/reject")
+async def webapp_reject_order(
+    order_id: str,
+    current_admin: dict = Depends(get_current_admin),
+    request: Request = None
+):
+    conn = await get_db_connection()
+    try:
+        row = await conn.fetchrow("SELECT id, status FROM webapp_orders WHERE order_id = $1", order_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Order not found")
+        if row['status'] != 'pending':
+            raise HTTPException(status_code=400, detail=f"Order is already {row['status']}")
+
+        await conn.execute("UPDATE webapp_orders SET status = 'rejected' WHERE order_id = $1", order_id)
+
+        client_ip = request.client.host if request and request.client else "unknown"
+        await log_action(current_admin["id"], "reject_webapp_order", f"Rejected order {order_id}", client_ip)
+
+        return {"success": True, "order_id": order_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error rejecting webapp order: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        await conn.close()
+
+
+@app.get("/api/webapp/keys/{user_id}")
+async def webapp_get_user_keys(user_id: int):
+    conn = await get_db_connection()
+    try:
+        rows = await conn.fetch("""
+            SELECT id, key_value, name, level, duration,
+                   purchase_date, expiry_date, status
+            FROM webapp_keys
+            WHERE user_id = $1
+            ORDER BY created_at DESC
+        """, user_id)
+        keys = []
+        for row in rows:
+            k = dict(row)
+            if k.get('purchase_date'):
+                k['purchase_date'] = k['purchase_date'].isoformat()
+            if k.get('expiry_date'):
+                k['expiry_date'] = k['expiry_date'].isoformat()
+            keys.append(k)
+        return {"keys": keys}
+    finally:
+        await conn.close()
+
+
+@app.post("/api/webapp/activate")
+async def webapp_activate_key(activation: ActivationRequest, request: Request):
+    """Reuses existing activate_key logic — delegates to the same handler."""
+    conn = await get_db_connection()
+    try:
+        key_row = await conn.fetchrow("""
+            SELECT id, key_value, type, duration, max_devices, max_percent, status, is_active
+            FROM keys
+            WHERE key_value = $1
+        """, activation.key_code)
+
+        if not key_row:
+            raise HTTPException(status_code=404, detail="Key not found")
+        if not key_row['is_active']:
+            raise HTTPException(status_code=400, detail="Key is disabled")
+
+        key_id = key_row['id']
+        key_status = key_row['status']
+
+        if key_status == 'deleted':
+            raise HTTPException(status_code=400, detail="Key has been deleted")
+
+        existing = await conn.fetchrow(
+            "SELECT id, is_active, expires_at FROM activations WHERE key_id = $1 AND device_id = $2",
+            key_id, activation.device_id
+        )
+        total_used = await conn.fetchval(
+            "SELECT COUNT(*) FROM activations WHERE key_id = $1", key_id
+        )
+
+        if not existing and total_used >= key_row['max_devices']:
+            raise HTTPException(status_code=400, detail="Device limit reached (all slots used)")
+
+        if existing and existing['is_active']:
+            exp = existing['expires_at']
+            if isinstance(exp, str):
+                exp = datetime.fromisoformat(exp.replace(' ', 'T'))
+            if exp > datetime.now():
+                return {"message": "Device already active", "device_id": activation.device_id}
+
+        if key_row['type'] == 'DAY':
+            expires_at = datetime.now() + timedelta(days=key_row['duration'])
+        else:
+            expires_at = datetime.now() + timedelta(hours=key_row['duration'])
+
+        if existing:
+            await conn.execute("""
+                UPDATE activations SET is_active = true, activated_at = NOW(), expires_at = $1
+                WHERE id = $2
+            """, expires_at, existing['id'])
+        else:
+            await conn.execute("""
+                INSERT INTO activations (key_id, device_id, expires_at, activated_at)
+                VALUES ($1, $2, $3, NOW())
+            """, key_id, activation.device_id, expires_at)
+            await conn.execute("""
+                UPDATE keys SET used_devices = used_devices + 1,
+                    first_activation = COALESCE(first_activation, NOW())
+                WHERE id = $1
+            """, key_id)
+
+        total_now = await conn.fetchval(
+            "SELECT COUNT(*) FROM activations WHERE key_id = $1", key_id
+        )
+        new_status = 'full' if total_now >= key_row['max_devices'] else 'active'
+        await conn.execute("UPDATE keys SET status = $1 WHERE id = $2", new_status, key_id)
+
+        return {
+            "success": True,
+            "message": "Key activated successfully",
+            "device_id": activation.device_id,
+            "expires_at": expires_at.isoformat(),
+            "percent": key_row['max_percent']
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in webapp activate: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        await conn.close()
+
+
+@app.get("/api/webapp/check/{key_code}/{device_id}")
+async def webapp_check_key(key_code: str, device_id: str):
+    conn = await get_db_connection()
+    try:
+        result = await conn.fetchrow("""
+            SELECT k.max_percent, a.expires_at, a.is_active, k.is_active as key_active, k.status
+            FROM keys k
+            JOIN activations a ON k.id = a.key_id
+            WHERE k.key_value = $1 AND a.device_id = $2
+        """, key_code, device_id)
+
+        if not result:
+            return {"valid": False, "message": "Key not found or not activated for this device"}
+
+        if not result['key_active'] or result['status'] == 'deleted':
+            return {"valid": False, "message": "Key has been revoked"}
+
+        if not result['is_active']:
+            return {"valid": False, "message": "Activation is inactive or revoked"}
+
+        expires_at = result['expires_at']
+        if isinstance(expires_at, str):
+            expires_at = datetime.fromisoformat(expires_at.replace(' ', 'T'))
+
+        if expires_at < datetime.now():
+            return {"valid": False, "message": "Key expired"}
+
+        hours_remaining = (expires_at - datetime.now()).total_seconds() / 3600
+        return {
+            "valid": True,
+            "percent": result['max_percent'],
+            "expires_at": expires_at.isoformat(),
+            "hours_remaining": round(hours_remaining, 2),
+            "device_id": device_id
+        }
+    except Exception as e:
+        logger.error(f"Error in webapp check_key: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        await conn.close()
+
+
+@app.post("/api/webapp/devices/register")
+async def webapp_register_device(device_data: DeviceRegister, request: Request):
+    conn = await get_db_connection()
+    try:
+        existing = await conn.fetchval(
+            "SELECT id FROM devices WHERE device_id = $1", device_data.device_id
+        )
+        if existing:
+            await conn.execute("""
+                UPDATE devices SET platform = $1, push_token = $2, last_active = NOW(), is_active = true
+                WHERE device_id = $3
+            """, device_data.platform, device_data.push_token, device_data.device_id)
+        else:
+            await conn.execute("""
+                INSERT INTO devices (device_id, platform, push_token)
+                VALUES ($1, $2, $3)
+            """, device_data.device_id, device_data.platform, device_data.push_token)
+        return {
+            "success": True,
+            "message": "Device registered successfully",
+            "device_id": device_data.device_id
+        }
+    finally:
+        await conn.close()
+
+
+@app.get("/api/webapp/ads")
+async def webapp_get_ads(
+    request: Request,
+    app_version: Optional[str] = Query(None),
+    platform: Optional[str] = Query(None)
+):
+    conn = await get_db_connection()
+    try:
+        if not platform:
+            ua = request.headers.get("user-agent", "").lower()
+            if "android" in ua:
+                platform = "android"
+            elif "ios" in ua or "iphone" in ua:
+                platform = "ios"
+            elif "windows" in ua:
+                platform = "windows"
+            else:
+                platform = "web"
+
+        query = "SELECT html, is_closable, version, platform FROM advertisements WHERE is_active = true"
+        params = []
+        if app_version:
+            query += " AND (version = $1 OR version IS NULL)"
+            params.append(app_version)
+        query += " ORDER BY CASE WHEN version IS NULL THEN 1 ELSE 0 END, updated_at DESC LIMIT 1"
+
+        row = await conn.fetchrow(query, *params)
+        if row:
+            return {
+                "html": row['html'],
+                "is_closable": bool(row['is_closable']),
+                "version": row['version'],
+                "platform": row['platform']
+            }
+        return {"html": "", "is_closable": True, "version": None, "platform": platform}
+    finally:
+        await conn.close()
+
+
+@app.get("/api/webapp/settings")
+async def webapp_get_settings():
+    conn = await get_db_connection()
+    try:
+        settings = await get_settings_dict(conn)
+        settings.setdefault('download_zip_url', '')
+        settings.setdefault('download_version', '1')
+        return settings
+    finally:
+        await conn.close()
+
 
 # ============================================================
 # ОБРАБОТКА ОШИБОК

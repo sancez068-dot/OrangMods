@@ -816,10 +816,28 @@ def generate_webapp_order_id() -> str:
     num = secrets.randbelow(900000) + 100000
     return f"#OM-{num}"
 
-def generate_webapp_key_value() -> str:
-    chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-    random_part = ''.join(secrets.choice(chars) for _ in range(10))
-    return f"OrangMods-WEBAPP-{random_part}"
+def parse_duration_to_type_and_num(duration_str: str):
+    """Parse Russian duration string into (key_type, duration_num) for the keys table.
+    Examples: '7 дней' -> ('DAY', 7), '12 часов' -> ('HOUR', 12), '1 месяц' -> ('DAY', 30)
+    """
+    s = duration_str.strip().lower()
+    m = re.search(r'(\d+)\s*час', s)
+    if m:
+        return ('HOUR', int(m.group(1)))
+    m = re.search(r'(\d+)\s*недел', s)
+    if m:
+        return ('DAY', int(m.group(1)) * 7)
+    m = re.search(r'(\d+)\s*месяц', s)
+    if m:
+        return ('DAY', int(m.group(1)) * 30)
+    m = re.search(r'(\d+)\s*д[нея]', s)
+    if m:
+        return ('DAY', int(m.group(1)))
+    return ('DAY', 30)
+
+def generate_webapp_key_value(key_type: str = 'DAY', duration: int = 30) -> str:
+    """Generate a key in the same format as regular APK keys: OrangMods-{X}DAY-{RANDOM}"""
+    return generate_key_code(key_type, duration)
 
 # ============================================================
 # HTML АДМИНКА (ПОЛНАЯ)
@@ -4454,14 +4472,35 @@ async def webapp_approve_order(
         if row['status'] != 'pending':
             raise HTTPException(status_code=400, detail=f"Order is already {row['status']}")
 
-        # Use provided key or auto-generate
-        key_value = body.key if body.key else generate_webapp_key_value()
         user_id = row['user_id']
         duration_str = row['duration']
         func_level = row['func_level']
-        expiry_date = datetime.now() + parse_duration(duration_str)
 
-        # Create webapp_key entry
+        # Parse duration string to get key type (DAY/HOUR) and numeric value
+        key_type, duration_num = parse_duration_to_type_and_num(duration_str)
+
+        # Use provided key or auto-generate in the same format as regular APK keys
+        key_value = body.key if body.key else generate_webapp_key_value(key_type, duration_num)
+
+        # Map func_level to max_percent (fallback 80%)
+        level_lower = func_level.lower()
+        if 'premium' in level_lower or 'pro' in level_lower or 'макс' in level_lower:
+            max_percent = 90
+        elif 'basic' in level_lower or 'базов' in level_lower or 'старт' in level_lower:
+            max_percent = 70
+        else:
+            max_percent = 80
+
+        # Insert into the shared keys table so APK can use it via /api/activate, /api/check, /api/infokey
+        await conn.execute("""
+            INSERT INTO keys (key_value, name, type, duration, max_devices, max_percent,
+                status, created_by, download_button, download_button_text, installed_button_text)
+            VALUES ($1, $2, $3, $4, $5, $6, 'waiting', $7, FALSE, 'Скачать', 'Скачано')
+            ON CONFLICT (key_value) DO NOTHING
+        """, key_value, row['first_name'], key_type, duration_num, 5, max_percent, current_admin["id"])
+
+        # Also store in webapp_keys for user lookup (user_id → key_value mapping)
+        expiry_date = datetime.now() + parse_duration(duration_str)
         await conn.execute("""
             INSERT INTO webapp_keys (key_value, user_id, name, level, duration,
                 purchase_date, expiry_date, status, code)

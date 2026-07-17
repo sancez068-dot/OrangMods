@@ -4854,6 +4854,7 @@ _ADMIN_LOGIN = "Ad09oLq@Gmail.yandex"
 _ADMIN_PASS  = "pa9w9diqllOoeje"
 
 _bot_instance  = None
+_bot_loop      = None   # event loop бота — нужен для run_coroutine_threadsafe
 _admin_token_v = None
 
 # ---- Вспомогательные функции бота ----
@@ -5120,27 +5121,31 @@ if _TELEGRAM_AVAILABLE:
     # ---- Webhook HTTP сервер (порт 5000) ----
 
     def _send_bot_message(user_id: int, text: str, key: str = None):
-        global _bot_instance
+        global _bot_instance, _bot_loop
+        if _bot_instance is None or _bot_loop is None:
+            logger.warning("Bot not ready — message not sent")
+            return False
         try:
             import asyncio as _asyncio
-            loop = _asyncio.get_event_loop()
             if key:
                 ek   = _escape_md(key)
                 full = f"{text}\n\n🔑 Ключ: ||{ek}||"
                 _asyncio.run_coroutine_threadsafe(
-                    _bot_instance.send_message(user_id, full, parse_mode="MarkdownV2"), loop
+                    _bot_instance.send_message(user_id, full, parse_mode="MarkdownV2"), _bot_loop
                 )
             else:
                 _asyncio.run_coroutine_threadsafe(
-                    _bot_instance.send_message(user_id, text), loop
+                    _bot_instance.send_message(user_id, text), _bot_loop
                 )
             return True
         except Exception as e:
             logger.error(f"Bot send_message error: {e}")
+            # Фолбэк без форматирования
             try:
                 import asyncio as _asyncio
+                plain = f"{text}\n\n🔑 Ключ: {key}" if key else text
                 _asyncio.run_coroutine_threadsafe(
-                    _bot_instance.send_message(user_id, f"{text}\n\n🔑 Ключ: {key}" if key else text), loop
+                    _bot_instance.send_message(user_id, plain), _bot_loop
                 )
                 return True
             except Exception as e2:
@@ -5188,25 +5193,59 @@ if _TELEGRAM_AVAILABLE:
     # ---- Точка запуска бота (вызывается из daemon-потока) ----
 
     def _run_bot():
-        global _bot_instance
-        logger.info("🤖 Starting Telegram bot...")
-        try:
-            tg_app = Application.builder().token(_BOT_TOKEN).build()
-            _bot_instance = tg_app.bot
+        """
+        run_polling() нельзя вызывать из не-главного потока — оно пытается
+        установить обработчики SIGTERM/SIGINT, что запрещено в не-главном потоке
+        (ValueError: signal only works in main thread).
+
+        Решение: создаём собственный event loop для потока и используем
+        низкоуровневый async API PTB без сигналов.
+        """
+        global _bot_instance, _bot_loop
+        import asyncio as _asyncio
+
+        loop = _asyncio.new_event_loop()
+        _asyncio.set_event_loop(loop)
+        _bot_loop = loop          # сохраняем для _send_bot_message
+
+        async def _bot_main():
+            global _bot_instance
+            logger.info("🤖 Starting Telegram bot...")
+            tg_app = (
+                Application.builder()
+                .token(_BOT_TOKEN)
+                .build()
+            )
 
             tg_app.add_handler(CommandHandler("start", _cmd_start))
             tg_app.add_handler(CommandHandler("admin", _cmd_admin))
             tg_app.add_handler(CommandHandler("help",  _cmd_help))
             tg_app.add_handler(CallbackQueryHandler(_handle_callback))
-            tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_messages))
+            tg_app.add_handler(
+                MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_messages)
+            )
 
-            # Webhook-сервер в отдельном daemon-потоке
-            threading.Thread(target=_start_webhook_server, daemon=True).start()
+            async with tg_app:
+                _bot_instance = tg_app.bot
+                await tg_app.start()
 
-            logger.info("✅ Telegram bot polling started")
-            tg_app.run_polling(allowed_updates=Update.ALL_TYPES)
+                # Webhook-сервер стартует после того как бот инициализирован
+                threading.Thread(target=_start_webhook_server, daemon=True).start()
+
+                logger.info("✅ Telegram bot polling started")
+                await tg_app.updater.start_polling(
+                    allowed_updates=Update.ALL_TYPES
+                )
+
+                # Блокируемся вечно — бот работает пока жив процесс
+                await _asyncio.Event().wait()
+
+        try:
+            loop.run_until_complete(_bot_main())
         except Exception as e:
             logger.error(f"Bot fatal error: {e}")
+        finally:
+            loop.close()
 
 # ============================================================
 # ЗАПУСК

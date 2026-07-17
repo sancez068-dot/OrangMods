@@ -5,24 +5,10 @@ import secrets
 import logging
 import json
 import re
-import threading
-import requests as _requests
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 from contextlib import asynccontextmanager
 from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
-# ── Telegram bot imports (bot runs in a separate thread, не влияет на API) ──
-try:
-    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
-    from telegram.ext import (
-        Application, CommandHandler, CallbackQueryHandler,
-        MessageHandler, filters, ContextTypes,
-    )
-    _TELEGRAM_AVAILABLE = True
-except ImportError:
-    _TELEGRAM_AVAILABLE = False
 
 from fastapi import FastAPI, HTTPException, Depends, Request, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,6 +23,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from cachetools import TTLCache
 import asyncpg
+import httpx
 
 # Настройка логирования
 logging.basicConfig(
@@ -70,6 +57,10 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "*").split(",")
 MAX_LIMIT = int(os.getenv("MAX_LIMIT", "100"))
+
+# Telegram Bot
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+ADMIN_TELEGRAM_ID  = os.getenv("ADMIN_TELEGRAM_ID", "")
 
 # ============================================================
 # КЕШ ДЛЯ /API/INFOKEY
@@ -825,6 +816,27 @@ def parse_duration(duration_str: str) -> timedelta:
     if m:
         return timedelta(days=int(m.group(1)))
     return timedelta(days=30)
+
+async def send_telegram_message(chat_id: int | str, text: str, parse_mode: str = "HTML") -> bool:
+    """Отправить сообщение через Telegram Bot API. Возвращает True при успехе."""
+    if not TELEGRAM_BOT_TOKEN or not chat_id:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(url, json={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": parse_mode,
+                "disable_web_page_preview": True,
+            })
+            result = resp.json()
+            if not result.get("ok"):
+                logger.warning(f"Telegram send failed for chat_id={chat_id}: {result.get('description')}")
+            return bool(result.get("ok"))
+    except Exception as e:
+        logger.warning(f"Telegram send error for chat_id={chat_id}: {e}")
+        return False
 
 def generate_webapp_order_id() -> str:
     num = secrets.randbelow(900000) + 100000
@@ -4433,6 +4445,22 @@ async def webapp_create_order(order_data: WebAppOrderCreate):
             order_data.func_level, order_data.func_price, order_data.duration,
             order_data.duration_price, order_data.total_price)
 
+        # Уведомляем администратора в Telegram о новом заказе
+        if ADMIN_TELEGRAM_ID:
+            settings = await get_settings_dict(conn)
+            tg_user = settings.get("telegram_username", "SofterTeamBot")
+            msg = (
+                f"🛒 <b>Новый заказ OrangMods</b>\n\n"
+                f"🔑 Order: <code>{order_id}</code>\n"
+                f"👤 Пользователь: {order_data.first_name} "
+                f"(@{order_data.username}, id: {order_data.user_id})\n"
+                f"⚙️ Уровень: {order_data.func_level}\n"
+                f"⏱ Длительность: {order_data.duration}\n"
+                f"💰 Итого: {order_data.total_price}⭐\n\n"
+                f"Для одобрения перейдите в панель администратора."
+            )
+            await send_telegram_message(ADMIN_TELEGRAM_ID, msg)
+
         return {
             "success": True,
             "order_id": order_id,
@@ -4548,6 +4576,25 @@ async def webapp_approve_order(
         await log_action(current_admin["id"], "approve_webapp_order",
                          f"Approved order {order_id}, key={key_value}, percent={max_percent}", client_ip)
 
+        # Уведомляем пользователя об одобрении заказа
+        msg_user = (
+            f"✅ <b>Заказ одобрен!</b>\n\n"
+            f"🔑 Order: <code>{order_id}</code>\n"
+            f"🗝 Ваш ключ: <code>{key_value}</code>\n"
+            f"⚙️ Уровень: {func_level}\n"
+            f"⏱ Длительность: {duration_str}\n\n"
+            f"Вставьте ключ в приложение OrangMods для активации."
+        )
+        await send_telegram_message(user_id, msg_user)
+
+        # Уведомляем администратора об успешном одобрении
+        if ADMIN_TELEGRAM_ID:
+            msg_admin = (
+                f"✅ Заказ <code>{order_id}</code> одобрен\n"
+                f"Ключ: <code>{key_value}</code>  Percent: {max_percent}%"
+            )
+            await send_telegram_message(ADMIN_TELEGRAM_ID, msg_admin)
+
         return {"success": True, "order_id": order_id, "key": key_value, "percent": max_percent}
     except HTTPException:
         raise
@@ -4566,7 +4613,10 @@ async def webapp_reject_order(
 ):
     conn = await get_db_connection()
     try:
-        row = await conn.fetchrow("SELECT id, status FROM webapp_orders WHERE order_id = $1", order_id)
+        row = await conn.fetchrow(
+            "SELECT id, status, user_id, first_name, func_level, duration FROM webapp_orders WHERE order_id = $1",
+            order_id
+        )
         if not row:
             raise HTTPException(status_code=404, detail="Order not found")
         if row['status'] != 'pending':
@@ -4576,6 +4626,16 @@ async def webapp_reject_order(
 
         client_ip = request.client.host if request and request.client else "unknown"
         await log_action(current_admin["id"], "reject_webapp_order", f"Rejected order {order_id}", client_ip)
+
+        # Уведомляем пользователя об отклонении заказа
+        msg_user = (
+            f"❌ <b>Заказ отклонён</b>\n\n"
+            f"🔑 Order: <code>{order_id}</code>\n"
+            f"⚙️ Уровень: {row['func_level']}\n"
+            f"⏱ Длительность: {row['duration']}\n\n"
+            f"Если у вас есть вопросы, свяжитесь с поддержкой."
+        )
+        await send_telegram_message(row['user_id'], msg_user)
 
         return {"success": True, "order_id": order_id}
     except HTTPException:
@@ -4833,437 +4893,14 @@ async def general_exception_handler(request: Request, exc: Exception):
     )
 
 # ============================================================
-# ██████╗  ██████╗ ████████╗    ██████╗ ██╗      ██████╗  ██████╗██╗  ██╗
-# ██╔══██╗██╔═══██╗╚══██╔══╝    ██╔══██╗██║     ██╔═══██╗██╔════╝██║ ██╔╝
-# ██████╔╝██║   ██║   ██║       ██████╔╝██║     ██║   ██║██║     █████╔╝
-# ██╔══██╗██║   ██║   ██║       ██╔══██╗██║     ██║   ██║██║     ██╔═██╗
-# ██████╔╝╚██████╔╝   ██║       ██████╔╝███████╗╚██████╔╝╚██████╗██║  ██╗
-# ╚═════╝  ╚═════╝    ╚═╝       ╚═════╝ ╚══════╝ ╚═════╝  ╚═════╝╚═╝  ╚═╝
-#
-# TELEGRAM BOT — работает параллельно с API в отдельном потоке.
-# НЕ связан с API-логикой, никак её не затрагивает.
-# ============================================================
-
-# ---- Конфигурация бота ----
-_BOT_TOKEN   = "8647781228:AAFg20oC1jmGl10qwN9uzDWKd-2vuuynknc"
-_WEBAPP_URL  = "https://orangmodstg.onrender.com"
-_BOT_API_URL = "https://orangmods.onrender.com/api/webapp"
-
-_ADMIN_IDS   = [7558811554, 7597506876]
-_ADMIN_LOGIN = "Ad09oLq@Gmail.yandex"
-_ADMIN_PASS  = "pa9w9diqllOoeje"
-
-_bot_instance  = None
-_bot_loop      = None   # event loop бота — нужен для run_coroutine_threadsafe
-_admin_token_v = None
-
-# ---- Вспомогательные функции бота ----
-
-def _get_admin_token():
-    global _admin_token_v
-    if _admin_token_v:
-        return _admin_token_v
-    try:
-        r = _requests.post(
-            "https://orangmods.onrender.com/api/login",
-            json={"login": _ADMIN_LOGIN, "password": _ADMIN_PASS},
-            timeout=10,
-        )
-        d = r.json()
-        if d.get("success") and d.get("token"):
-            _admin_token_v = d["token"]
-            logger.info("✅ Bot: admin token obtained")
-            return _admin_token_v
-    except Exception as e:
-        logger.error(f"Bot: admin auth error: {e}")
-    return None
-
-
-def _api(method: str, endpoint: str, data=None, need_auth=False):
-    url = f"{_BOT_API_URL}{endpoint}"
-    headers = {"Content-Type": "application/json"}
-    if need_auth:
-        tok = _get_admin_token()
-        if tok:
-            headers["Authorization"] = f"Bearer {tok}"
-        else:
-            return None
-    try:
-        if method.upper() == "GET":
-            r = _requests.get(url, headers=headers, timeout=10)
-        else:
-            r = _requests.post(url, json=data, headers=headers, timeout=10)
-        if r.status_code in (200, 201):
-            return r.json()
-        logger.error(f"Bot API {r.status_code}: {r.text[:100]}")
-    except Exception as e:
-        logger.error(f"Bot API error: {e}")
-    return None
-
-
-def _escape_md(text: str) -> str:
-    for ch in r'_*[]()~`>#+-=|{}.!':
-        text = text.replace(ch, f"\\{ch}")
-    return text
-
-
-def _get_orders():
-    res = _api("GET", "/orders", need_auth=True)
-    return res.get("orders", []) if res else []
-
-
-def _get_stats():
-    orders = _get_orders()
-    return {
-        "total":    len(orders),
-        "pending":  sum(1 for o in orders if o.get("status") == "pending"),
-        "approved": sum(1 for o in orders if o.get("status") == "approved"),
-        "rejected": sum(1 for o in orders if o.get("status") == "rejected"),
-    }
-
-
-# ---- Клавиатуры ----
-
-if _TELEGRAM_AVAILABLE:
-    def _kb_main():
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🚀 Открыть OrangMods", web_app=WebAppInfo(url=_WEBAPP_URL))],
-            [InlineKeyboardButton("📦 Мои ключи", callback_data="my_keys"),
-             InlineKeyboardButton("💎 Прайс",    callback_data="prices")],
-            [InlineKeyboardButton("❓ Помощь", callback_data="help")],
-        ])
-
-    def _kb_admin():
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("⚙️ Админ-панель", web_app=WebAppInfo(url=_WEBAPP_URL))],
-            [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats"),
-             InlineKeyboardButton("📢 Рассылка",   callback_data="admin_broadcast")],
-            [InlineKeyboardButton("📋 Заказы",     callback_data="admin_orders"),
-             InlineKeyboardButton("📥 Экспорт",    callback_data="admin_export")],
-            [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")],
-        ])
-
-    def _kb_back():
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")],
-        ])
-
-    # ---- Обработчики команд ----
-
-    async def _cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        name = update.effective_user.first_name or "Пользователь"
-        await update.message.reply_text(
-            f"🍊 Привет, {name}!\n\nЭто бот для продажи ключей к софту OrangMods.\n\n"
-            "Нажми кнопку ниже, чтобы открыть приложение.",
-            reply_markup=_kb_main(),
-        )
-
-    async def _cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id not in _ADMIN_IDS:
-            await update.message.reply_text("❌ Нет доступа.")
-            return
-        await update.message.reply_text("⚙️ Админ-панель", reply_markup=_kb_admin())
-
-    async def _cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "❓ Как купить ключ?\n\n1. Нажми «Открыть OrangMods»\n"
-            "2. Выбери % и срок\n3. Оплати звёздами\n4. Жди подтверждения\n\n"
-            "Если ключ не работает — @Moirouk",
-            reply_markup=_kb_back(),
-        )
-
-    # ---- Обработчик callback ----
-
-    async def _handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        import csv, io as _io
-        query   = update.callback_query
-        await query.answer()
-        data    = query.data
-        user_id = update.effective_user.id
-
-        if data == "back_to_main":
-            await query.message.edit_text("🍊 OrangMods\n\nВыбери действие:", reply_markup=_kb_main())
-            return
-
-        if data == "my_keys":
-            kd = _api("GET", f"/keys/{user_id}")
-            if not kd or not kd.get("keys"):
-                await query.message.edit_text(
-                    "📦 У тебя пока нет ключей.\n\nКупи через приложение!",
-                    reply_markup=_kb_back(),
-                )
-                return
-            msg = "📦 Твои ключи:\n\n"
-            for k in kd["keys"][:10]:
-                st = "Активен" if k.get("status") == "active" else "Не активен"
-                msg += f"🔑 {k.get('key_value','—')}\n📊 {k.get('max_percent',0)}% | ⏳ {k.get('duration',0)} дн.\nСтатус: {st}\n\n"
-            await query.message.edit_text(msg, reply_markup=_kb_back())
-            return
-
-        if data == "prices":
-            await query.message.edit_text(
-                "💎 Прайс\n\n📊 % функционала:\n1–50% — 40⭐\n51–70% — 80⭐\n"
-                "71–80% — 100⭐\n81–95% — 125⭐\n\n⏳ Срок:\n1 час — 15⭐\n"
-                "1 день — 50⭐\n1 неделя — 200⭐\n1 месяц — 650⭐",
-                reply_markup=_kb_back(),
-            )
-            return
-
-        if data == "help":
-            await query.message.edit_text(
-                "❓ Как купить ключ?\n\n1. Нажми «Открыть OrangMods»\n"
-                "2. Выбери % и срок\n3. Оплати звёздами\n4. Жди подтверждения\n\n"
-                "Если ключ не работает — @Moirouk",
-                reply_markup=_kb_back(),
-            )
-            return
-
-        # Только для админов
-        if user_id not in _ADMIN_IDS:
-            await query.answer("❌ Нет доступа", show_alert=True)
-            return
-
-        if data == "admin_stats":
-            st = _get_stats()
-            await query.message.edit_text(
-                f"📊 Статистика\n\n🔑 Всего заказов: {st['total']}\n"
-                f"⏳ Ожидают: {st['pending']}\n✅ Одобрено: {st['approved']}\n"
-                f"❌ Отклонено: {st['rejected']}",
-                reply_markup=_kb_admin(),
-            )
-            return
-
-        if data == "admin_orders":
-            orders = _get_orders()
-            if not orders:
-                await query.message.edit_text("📋 Заказов нет", reply_markup=_kb_admin())
-                return
-            sm = {"pending": "⏳ Ожидает", "approved": "✅ Одобрен", "rejected": "❌ Отклонён"}
-            msg = "📋 Заказы:\n\n"
-            for o in orders[:10]:
-                msg += (f"{sm.get(o.get('status'),'❓')} {o.get('order_id','—')}\n"
-                        f"👤 {o.get('first_name','—')} @{o.get('username','—')}\n"
-                        f"💰 {o.get('total_price',0)}⭐\n\n")
-            await query.message.edit_text(msg, reply_markup=_kb_admin())
-            return
-
-        if data == "admin_broadcast":
-            context.user_data["broadcast_mode"] = True
-            await query.message.edit_text(
-                "📢 Отправь текст для рассылки.\n/cancel — отмена.",
-                reply_markup=_kb_admin(),
-            )
-            return
-
-        if data == "admin_export":
-            await query.message.edit_text(
-                "📥 Выбери формат:",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📊 CSV",  callback_data="export_csv"),
-                     InlineKeyboardButton("📄 JSON", callback_data="export_json")],
-                    [InlineKeyboardButton("🔙 Назад", callback_data="admin_back")],
-                ]),
-            )
-            return
-
-        if data == "export_csv":
-            orders = _get_orders()
-            if not orders:
-                await query.message.edit_text("❌ Нет данных", reply_markup=_kb_admin())
-                return
-            out = _io.StringIO()
-            w = csv.writer(out, delimiter=";")
-            w.writerow(["Номер", "Пользователь", "Username", "TG ID", "Уровень", "Срок", "Стоимость", "Статус", "Ключ", "Дата"])
-            for o in orders:
-                w.writerow([o.get("order_id","—"), o.get("first_name","—"), o.get("username","—"),
-                             o.get("user_id","—"), o.get("func_level","—"), o.get("duration","—"),
-                             f"{o.get('total_price',0)}⭐", o.get("status","—"), o.get("key","—"),
-                             (o.get("created_at","—") or "—")[:10]])
-            await query.message.reply_document(
-                document=("orders.csv", out.getvalue().encode("utf-8-sig")),
-                caption="📊 Экспорт заказов в CSV",
-            )
-            await query.message.edit_text("✅ CSV отправлен", reply_markup=_kb_admin())
-            return
-
-        if data == "export_json":
-            orders = _get_orders()
-            if not orders:
-                await query.message.edit_text("❌ Нет данных", reply_markup=_kb_admin())
-                return
-            await query.message.reply_document(
-                document=("orders.json", json.dumps(orders, ensure_ascii=False, indent=2).encode("utf-8")),
-                caption="📄 Экспорт заказов в JSON",
-            )
-            await query.message.edit_text("✅ JSON отправлен", reply_markup=_kb_admin())
-            return
-
-        if data == "admin_back":
-            await query.message.edit_text("⚙️ Админ-панель", reply_markup=_kb_admin())
-            return
-
-    # ---- Обработчик сообщений ----
-
-    async def _handle_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        text    = update.message.text
-        if context.user_data.get("broadcast_mode"):
-            if text == "/cancel":
-                context.user_data["broadcast_mode"] = False
-                await update.message.reply_text("✅ Отменено", reply_markup=_kb_admin())
-                return
-            await update.message.reply_text("✅ Рассылка отправлена (демо)", reply_markup=_kb_admin())
-            context.user_data["broadcast_mode"] = False
-            return
-        if user_id in _ADMIN_IDS and text and not text.startswith("/"):
-            await update.message.reply_text("❓ Команды:\n/start — главная\n/admin — админка\n/help — помощь")
-
-    # ---- Webhook HTTP сервер (порт 5000) ----
-
-    def _send_bot_message(user_id: int, text: str, key: str = None):
-        global _bot_instance, _bot_loop
-        if _bot_instance is None or _bot_loop is None:
-            logger.warning("Bot not ready — message not sent")
-            return False
-        try:
-            import asyncio as _asyncio
-            if key:
-                ek   = _escape_md(key)
-                full = f"{text}\n\n🔑 Ключ: ||{ek}||"
-                _asyncio.run_coroutine_threadsafe(
-                    _bot_instance.send_message(user_id, full, parse_mode="MarkdownV2"), _bot_loop
-                )
-            else:
-                _asyncio.run_coroutine_threadsafe(
-                    _bot_instance.send_message(user_id, text), _bot_loop
-                )
-            return True
-        except Exception as e:
-            logger.error(f"Bot send_message error: {e}")
-            # Фолбэк без форматирования
-            try:
-                import asyncio as _asyncio
-                plain = f"{text}\n\n🔑 Ключ: {key}" if key else text
-                _asyncio.run_coroutine_threadsafe(
-                    _bot_instance.send_message(user_id, plain), _bot_loop
-                )
-                return True
-            except Exception as e2:
-                logger.error(f"Bot send_message retry error: {e2}")
-        return False
-
-    class _WebhookHandler(BaseHTTPRequestHandler):
-        def do_POST(self):
-            length   = int(self.headers.get("Content-Length", 0))
-            raw      = self.rfile.read(length)
-            try:
-                data     = json.loads(raw)
-                uid      = data.get("user_id")
-                if self.path == "/webhook/order-approved":
-                    key      = data.get("key")
-                    order_id = data.get("order_id")
-                    if uid and key:
-                        _send_bot_message(uid, f"🎉 Заказ {order_id} одобрен!\n\nВажно: ключ на одну активацию.", key)
-                        self._ok(); return
-                elif self.path == "/webhook/order-rejected":
-                    order_id = data.get("order_id")
-                    if uid:
-                        _send_bot_message(uid, f"❌ Заказ {order_id} отклонён.\n\nПо вопросам — @Moirouk")
-                        self._ok(); return
-            except Exception as e:
-                logger.error(f"Bot webhook error: {e}")
-            self.send_response(400); self.end_headers()
-            self.wfile.write(b'{"status":"error"}')
-
-        def _ok(self):
-            self.send_response(200); self.end_headers()
-            self.wfile.write(b'{"status":"ok"}')
-
-        def log_message(self, *a):
-            pass
-
-    def _start_webhook_server():
-        try:
-            srv = HTTPServer(("0.0.0.0", 5000), _WebhookHandler)
-            logger.info("📡 Bot webhook server on :5000")
-            srv.serve_forever()
-        except Exception as e:
-            logger.error(f"Bot webhook server error: {e}")
-
-    # ---- Точка запуска бота (вызывается из daemon-потока) ----
-
-    def _run_bot():
-        """
-        run_polling() нельзя вызывать из не-главного потока — оно пытается
-        установить обработчики SIGTERM/SIGINT, что запрещено в не-главном потоке
-        (ValueError: signal only works in main thread).
-
-        Решение: создаём собственный event loop для потока и используем
-        низкоуровневый async API PTB без сигналов.
-        """
-        global _bot_instance, _bot_loop
-        import asyncio as _asyncio
-
-        loop = _asyncio.new_event_loop()
-        _asyncio.set_event_loop(loop)
-        _bot_loop = loop          # сохраняем для _send_bot_message
-
-        async def _bot_main():
-            global _bot_instance
-            logger.info("🤖 Starting Telegram bot...")
-            tg_app = (
-                Application.builder()
-                .token(_BOT_TOKEN)
-                .build()
-            )
-
-            tg_app.add_handler(CommandHandler("start", _cmd_start))
-            tg_app.add_handler(CommandHandler("admin", _cmd_admin))
-            tg_app.add_handler(CommandHandler("help",  _cmd_help))
-            tg_app.add_handler(CallbackQueryHandler(_handle_callback))
-            tg_app.add_handler(
-                MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_messages)
-            )
-
-            async with tg_app:
-                _bot_instance = tg_app.bot
-                await tg_app.start()
-
-                # Webhook-сервер стартует после того как бот инициализирован
-                threading.Thread(target=_start_webhook_server, daemon=True).start()
-
-                logger.info("✅ Telegram bot polling started")
-                await tg_app.updater.start_polling(
-                    allowed_updates=Update.ALL_TYPES
-                )
-
-                # Блокируемся вечно — бот работает пока жив процесс
-                await _asyncio.Event().wait()
-
-        try:
-            loop.run_until_complete(_bot_main())
-        except Exception as e:
-            logger.error(f"Bot fatal error: {e}")
-        finally:
-            loop.close()
-
-# ============================================================
 # ЗАПУСК
 # ============================================================
 
 if __name__ == "__main__":
-    # Запускаем Telegram-бота в daemon-потоке (не мешает uvicorn)
-    if _TELEGRAM_AVAILABLE:
-        bot_thread = threading.Thread(target=_run_bot, daemon=True, name="telegram-bot")
-        bot_thread.start()
-        logger.info("🧵 Telegram bot thread started")
-    else:
-        logger.warning("python-telegram-bot not installed — bot disabled")
-
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(
         app,
         host="0.0.0.0",
         port=port,
-        log_level="info",
-    )
+        log_level="info"
+)
